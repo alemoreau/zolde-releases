@@ -1,0 +1,218 @@
+# Construit une version de Zolde et la publie ici, avec le manifeste de mise à jour
+# (latest.json) que lisent les applications de bureau.
+#
+# Lancement : `scripts/release.sh X.Y.Z` dans le dépôt du code (tag vX.Y.Z, puis ce
+# workflow), ou à la main : Actions › Release › Run workflow.
+#
+# Le code est privé : il est lu avec une clé de déploiement en lecture seule. Ce dépôt ne
+# contient que les paquets ; aucun code n'est publié, ni en release ni en artefact.
+#
+# Secrets :
+# - ZOLDE_DEPLOY_KEY : clé SSH (lecture seule) du dépôt du code ;
+# - TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD : signature des mises à
+#   jour du bureau (la clé publique est dans tauri.conf.json) ;
+# - ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD : signature de l'APK (une APK n'en
+#   remplace une autre que signée par la même clé).
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (X.Y.Z) ; le tag vX.Y.Z doit exister dans le dépôt du code"
+        required: true
+      draft:
+        description: "Brouillon (les applications ne le voient pas)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  OTP_VERSION: "29.1.2"
+  ELIXIR_VERSION: "1.20.5"
+  VERSION: ${{ inputs.version }}
+
+jobs:
+  desktop:
+    name: Bureau (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-22.04
+          - name: macOS
+            os: macos-14
+          - name: Windows
+            os: windows-2022
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Code (v${{ inputs.version }})
+        uses: actions/checkout@v4
+        with:
+          repository: alemoreau/zolde
+          ref: v${{ inputs.version }}
+          ssh-key: ${{ secrets.ZOLDE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Prérequis Linux de Tauri
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf file
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      - name: Interface en ligne de commande de Tauri
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Modules woob
+        working-directory: woob
+        run: |
+          mix local.hex --force && mix local.rebar --force
+          mix deps.get
+          mix zolde_woob.modules
+
+      - name: Release Erlang
+        working-directory: app
+        env:
+          MIX_ENV: prod
+        run: |
+          mix deps.get --only prod
+          mix assets.setup
+          mix assets.deploy
+          mix release zolde_app_desktop --overwrite
+
+      - name: Paquets Tauri (signés pour la mise à jour)
+        working-directory: app/src-tauri
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # AppImage : linuxdeploy ne retouche pas les bibliothèques de Python embarqué.
+          NO_STRIP: "true"
+        run: |
+          jq --arg v "$VERSION" '.version = $v' tauri.release.conf.json > release.json
+          cargo tauri build --config release.json
+
+      - name: Paquets et signatures
+        run: |
+          shopt -s globstar nullglob
+          mkdir -p dist
+          for f in app/src-tauri/target/release/bundle/**/*.{deb,rpm,AppImage,dmg,msi,exe,tar.gz,sig}; do
+            cp "$f" dist/
+          done
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bureau-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+
+  android:
+    name: Android
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Code (v${{ inputs.version }})
+        uses: actions/checkout@v4
+        with:
+          repository: alemoreau/zolde
+          ref: v${{ inputs.version }}
+          ssh-key: ${{ secrets.ZOLDE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: SDK, NDK et CMake (versions du gabarit de Mob)
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Outils
+        run: sudo apt-get install -y zip
+
+      - name: Clé de signature
+        working-directory: app/android
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          test -n "$KEYSTORE" || { echo "::error::secret ANDROID_KEYSTORE_BASE64 manquant"; exit 1; }
+          echo "$KEYSTORE" | base64 -d > upload_jks.keystore
+          printf 'storeFile=upload_jks.keystore\nstorePassword=%s\nkeyAlias=upload\nkeyPassword=%s\n' \
+            "$PASSWORD" "$PASSWORD" > keystore.properties
+
+      - name: APK
+        working-directory: app
+        run: |
+          # X.Y.Z -> X*10000 + Y*100 + Z : toujours croissant d'une version à la suivante.
+          IFS=. read -r major minor patch <<< "$VERSION"
+          export ZOLDE_VERSION="$VERSION"
+          export ZOLDE_VERSION_CODE=$((major * 10000 + minor * 100 + patch))
+          mix local.hex --force && mix local.rebar --force
+          mix deps.get
+          mix mob.install
+          mix mob.release --android
+          (cd android && ./gradlew assembleRelease)
+          mkdir -p ../dist
+          cp android/app/build/outputs/apk/release/app-release.apk "../dist/Zolde_${VERSION}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publication
+    needs: [desktop, android]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Manifeste de mise à jour
+        run: python3 scripts/latest_json.py "$VERSION" dist > dist/latest.json && cat dist/latest.json
+
+      - name: Release v${{ inputs.version }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(dist/*.{deb,rpm,AppImage,dmg,msi,exe,apk} dist/*.app.tar.gz dist/latest.json)
+          draft=()
+          [ "${{ inputs.draft }}" = "true" ] && draft=(--draft)
+          gh release create "v$VERSION" "${files[@]}" "${draft[@]}" \
+            --repo "$GITHUB_REPOSITORY" --title "Zolde $VERSION" \
+            --notes "Zolde $VERSION. Installation : voir le README du dépôt."
