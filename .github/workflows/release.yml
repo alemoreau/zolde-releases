@@ -112,12 +112,12 @@ jobs:
           cargo tauri build --config release.json
 
       - name: Paquets et signatures
+        # find plutôt que globstar : le bash de macOS (3.2) ne le connaît pas.
         run: |
-          shopt -s globstar nullglob
           mkdir -p dist
-          for f in app/src-tauri/target/release/bundle/**/*.{deb,rpm,AppImage,dmg,msi,exe,tar.gz,sig}; do
-            cp "$f" dist/
-          done
+          find app/src-tauri/target/release/bundle -type f \( -name '*.deb' -o -name '*.rpm' \
+            -o -name '*.AppImage' -o -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \
+            -o -name '*.tar.gz' -o -name '*.sig' \) -exec cp {} dist/ \;
           ls -la dist
 
       - uses: actions/upload-artifact@v4
