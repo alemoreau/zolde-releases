@@ -189,7 +189,17 @@ jobs:
           mix local.hex --force && mix local.rebar --force
           mix deps.get
           mix mob.install
+          # Styles et JavaScript de l'interface (priv/static/assets), après la compilation
+          # qui écrit le CSS et les hooks colocalisés : sans eux, la WebView affiche une
+          # page brute et LiveView ne se connecte pas.
+          mix assets.setup
+          mix compile
+          mix assets.deploy
           mix mob.release --android
+          for f in priv/static/assets/css/app.css priv/static/assets/js/app.js; do
+            unzip -l android/app/src/release/assets/otp.zip | grep -q "zolde_app/$f" \
+              || { echo "::error::$f absent de l'APK"; exit 1; }
+          done
           (cd android && ./gradlew assembleRelease)
           mkdir -p ../dist
           cp android/app/build/outputs/apk/release/app-release.apk "../dist/Zolde_${VERSION}.apk"
