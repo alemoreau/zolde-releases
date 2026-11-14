@@ -183,6 +183,9 @@ jobs:
           IFS=. read -r major minor patch <<< "$VERSION"
           export ZOLDE_VERSION="$VERSION"
           export ZOLDE_VERSION_CODE=$((major * 10000 + minor * 100 + patch))
+          # Compilé sans rechargement de code (config/dev.exs) : l'APK n'embarque pas
+          # les dépendances de développement.
+          export ZOLDE_MOBILE_BUILD=1
           mix local.hex --force && mix local.rebar --force
           mix deps.get
           mix mob.install
