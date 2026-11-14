@@ -95,6 +95,8 @@ jobs:
         run: |
           mix deps.get --only prod
           mix assets.setup
+          # Avant les assets : la compilation écrit le CSS et les hooks colocalisés.
+          mix compile
           mix assets.deploy
           mix release zolde_app_desktop --overwrite
 
